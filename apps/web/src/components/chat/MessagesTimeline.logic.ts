@@ -345,6 +345,8 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       turnId: TurnId;
+      /** See {@link TurnFold.foldId}. */
+      foldId: string;
       label: string;
       expanded: boolean;
     }
@@ -474,7 +476,7 @@ function deriveTerminalAssistantMessageIds(timelineEntries: ReadonlyArray<Timeli
     }
 
     const responseKey = message.turnId
-      ? `turn:${message.turnId}`
+      ? `turn:${message.turnId}:${nullTurnResponseIndex}`
       : `unkeyed:${nullTurnResponseIndex}`;
     lastAssistantMessageIdByResponseKey.set(responseKey, message.id);
   }
@@ -484,6 +486,11 @@ function deriveTerminalAssistantMessageIds(timelineEntries: ReadonlyArray<Timeli
 
 interface TurnFold {
   turnId: TurnId;
+  /**
+   * Unique per fold; equals `turnId` unless a steer split the turn into
+   * several folds, then `${turnId}:${userBoundaryIndex}`.
+   */
+  foldId: string;
   anchorEntryId: string;
   createdAt: string;
   hiddenEntryIds: ReadonlySet<string>;
@@ -567,10 +574,17 @@ function workEntryIsActiveTurnActivity(entry: WorkLogEntry): boolean {
   );
 }
 
+/** Callers may expand a fold by its own id or by the turn that produced it. */
+function isTurnFoldExpanded(fold: TurnFold, expandedTurnIds: ReadonlySet<string> | undefined) {
+  return expandedTurnIds?.has(fold.foldId) === true || expandedTurnIds?.has(fold.turnId) === true;
+}
+
 /**
  * Settled turns fold activity before their terminal assistant message behind
  * a "Worked for ..." row. A single ordinary activity after that message joins
  * the fold, while larger groups and failures stay visible as a trailing summary.
+ * A steer reuses its turn's id for the follow-up response, so each user
+ * message starts a new fold with its own terminal message.
  */
 function deriveTurnFolds(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
@@ -579,6 +593,9 @@ function deriveTurnFolds(input: {
   unfoldedTurnIds: ReadonlySet<TurnId>;
 }): ReadonlyMap<string, TurnFold> {
   interface TurnGroup {
+    turnId: TurnId;
+    /** Position among the segments this turn was split into. */
+    segmentIndex: number;
     entries: Array<TimelineEntry>;
     terminalEntry: Extract<TimelineEntry, { kind: "message" }> | null;
     hasStreamingMessage: boolean;
@@ -590,12 +607,15 @@ function deriveTurnFolds(input: {
      */
     startBoundary: string | null;
   }
-  const groupsByTurnId = new Map<TurnId, TurnGroup>();
+  const groupsByKey = new Map<string, TurnGroup>();
+  const lastGroupByTurnId = new Map<TurnId, TurnGroup>();
 
   let pendingUserBoundary: string | null = null;
+  let userBoundaryIndex = 0;
   for (const entry of input.timelineEntries) {
     if (entry.kind === "message" && entry.message.role === "user") {
       pendingUserBoundary = entry.message.createdAt;
+      userBoundaryIndex += 1;
       continue;
     }
     const turnId =
@@ -607,9 +627,12 @@ function deriveTurnFolds(input: {
     if (!turnId) {
       continue;
     }
-    let group = groupsByTurnId.get(turnId);
+    const key = `${turnId}:${userBoundaryIndex}`;
+    let group = groupsByKey.get(key);
     if (!group) {
       group = {
+        turnId,
+        segmentIndex: (lastGroupByTurnId.get(turnId)?.segmentIndex ?? -1) + 1,
         entries: [],
         terminalEntry: null,
         hasStreamingMessage: false,
@@ -619,7 +642,8 @@ function deriveTurnFolds(input: {
         startBoundary: pendingUserBoundary,
       };
       pendingUserBoundary = null;
-      groupsByTurnId.set(turnId, group);
+      groupsByKey.set(key, group);
+      lastGroupByTurnId.set(turnId, group);
     }
     group.entries.push(entry);
     if (entry.kind === "message") {
@@ -633,7 +657,11 @@ function deriveTurnFolds(input: {
   }
 
   const foldsByAnchorEntryId = new Map<string, TurnFold>();
-  for (const [turnId, group] of groupsByTurnId) {
+  for (const [key, group] of groupsByKey) {
+    const { turnId } = group;
+    const lastGroup = lastGroupByTurnId.get(turnId);
+    const isSingleSegmentForTurn = lastGroup?.segmentIndex === 0;
+    const isLastSegmentForTurn = lastGroup === group;
     if (input.unfoldedTurnIds.has(turnId)) {
       continue;
     }
@@ -686,16 +714,20 @@ function deriveTurnFolds(input: {
       continue;
     }
 
+    // `latestTurn` times the turn as a whole, so it only describes this group
+    // when the turn produced a single segment.
+    const isLatestTurn = input.latestTurn?.turnId === turnId && isSingleSegmentForTurn;
+    // The interruption hits the turn's last segment.
     const isLatestInterruptedTurn =
-      input.latestTurn?.turnId === turnId && input.latestTurn.state === "interrupted";
+      input.latestTurn?.turnId === turnId &&
+      input.latestTurn.state === "interrupted" &&
+      isLastSegmentForTurn;
     // A turn cut short by a steer leaves trailing work entries behind its
     // terminal message — take whichever ended last.
     const lastEntryEnd =
       lastEntry.kind === "message" ? lastEntry.message.updatedAt : lastEntry.createdAt;
     const elapsedMs =
-      input.latestTurn?.turnId === turnId &&
-      input.latestTurn.startedAt &&
-      input.latestTurn.completedAt
+      isLatestTurn && input.latestTurn?.startedAt && input.latestTurn.completedAt
         ? computeElapsedMs(input.latestTurn.startedAt, input.latestTurn.completedAt)
         : computeElapsedMs(
             group.startBoundary ?? firstEntry.createdAt,
@@ -713,6 +745,7 @@ function deriveTurnFolds(input: {
 
     foldsByAnchorEntryId.set(firstHiddenEntry.id, {
       turnId,
+      foldId: isSingleSegmentForTurn ? turnId : key,
       anchorEntryId: firstHiddenEntry.id,
       createdAt: firstHiddenEntry.createdAt,
       hiddenEntryIds,
@@ -848,7 +881,11 @@ export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   latestTurn?: TimelineLatestTurn | null;
   runningTurnId?: TurnId | null;
-  expandedTurnIds?: ReadonlySet<TurnId>;
+  /**
+   * Holds either a fold's `turnId` (citation jumps only know the turn) or its
+   * `foldId` (user toggles address one fold of a steered turn).
+   */
+  expandedTurnIds?: ReadonlySet<string>;
   expandedWorkGroupIds?: ReadonlySet<string>;
   isWorking: boolean;
   activeTurnStartedAt: string | null;
@@ -891,7 +928,7 @@ export function deriveMessagesTimelineRows(input: {
   });
   const collapsedEntryIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
-    if (!input.expandedTurnIds?.has(fold.turnId)) {
+    if (!isTurnFoldExpanded(fold, input.expandedTurnIds)) {
       for (const entryId of fold.hiddenEntryIds) {
         collapsedEntryIds.add(entryId);
       }
@@ -1013,11 +1050,12 @@ export function deriveMessagesTimelineRows(input: {
     if (anchoredTurnFold) {
       nextRows.push({
         kind: "turn-fold",
-        id: `turn-fold:${anchoredTurnFold.turnId}`,
+        id: `turn-fold:${anchoredTurnFold.foldId}`,
         createdAt: anchoredTurnFold.createdAt,
         turnId: anchoredTurnFold.turnId,
+        foldId: anchoredTurnFold.foldId,
         label: anchoredTurnFold.label,
-        expanded: input.expandedTurnIds?.has(anchoredTurnFold.turnId) ?? false,
+        expanded: isTurnFoldExpanded(anchoredTurnFold, input.expandedTurnIds),
       });
     }
 
