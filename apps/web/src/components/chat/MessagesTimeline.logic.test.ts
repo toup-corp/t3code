@@ -1399,6 +1399,185 @@ describe("deriveMessagesTimelineRows", () => {
     ).toBeDefined();
   });
 
+  it("starts a new fold at a steer's user message instead of swallowing the prior response", () => {
+    // Both user messages target "turn-1": the second one steers the turn.
+    const timelineEntries = [
+      {
+        id: "user-1-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:00Z",
+        message: {
+          id: "user-1" as never,
+          role: "user" as const,
+          text: "Build it",
+          turnId: null,
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "assistant-a1-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:05Z",
+        message: {
+          id: "assistant-a1" as never,
+          role: "assistant" as const,
+          text: "Working on it",
+          turnId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:05Z",
+          updatedAt: "2026-01-01T00:00:06Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "work-entry-1",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:08Z",
+        entry: {
+          id: "work-1",
+          createdAt: "2026-01-01T00:00:08Z",
+          turnId: "turn-1" as never,
+          label: "Ran command",
+          tone: "tool" as const,
+        },
+      },
+      {
+        id: "assistant-a2-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:10Z",
+        message: {
+          id: "assistant-a2" as never,
+          role: "assistant" as const,
+          text: "First response done",
+          turnId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:10Z",
+          updatedAt: "2026-01-01T00:00:11Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "user-2-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:15Z",
+        message: {
+          id: "user-2" as never,
+          role: "user" as const,
+          text: "Actually also do this",
+          turnId: null,
+          createdAt: "2026-01-01T00:00:15Z",
+          updatedAt: "2026-01-01T00:00:15Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "work-entry-2",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:18Z",
+        entry: {
+          id: "work-2",
+          createdAt: "2026-01-01T00:00:18Z",
+          turnId: "turn-1" as never,
+          label: "Ran another command",
+          tone: "tool" as const,
+        },
+      },
+      {
+        id: "assistant-a3-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:25Z",
+        message: {
+          id: "assistant-a3" as never,
+          role: "assistant" as const,
+          text: "Second response done",
+          turnId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:25Z",
+          updatedAt: "2026-01-01T00:00:26Z",
+          streaming: false,
+        },
+      },
+    ];
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+
+    expect(rows.some((row) => row.kind === "message" && row.message.id === "assistant-a2")).toBe(
+      true,
+    );
+    expect(rows.some((row) => row.kind === "message" && row.message.id === "assistant-a3")).toBe(
+      true,
+    );
+    expect(rows.some((row) => row.kind === "message" && row.message.id === "assistant-a1")).toBe(
+      false,
+    );
+    expect(rows.some((row) => row.kind === "work")).toBe(false);
+
+    const turnFoldRows = rows.filter(
+      (row): row is Extract<(typeof rows)[number], { kind: "turn-fold" }> =>
+        row.kind === "turn-fold",
+    );
+    expect(turnFoldRows).toHaveLength(2);
+    expect(turnFoldRows.every((row) => row.turnId === "turn-1")).toBe(true);
+    const foldIds = turnFoldRows.map((row) => row.foldId);
+    expect(new Set(foldIds).size).toBe(2);
+    expect(turnFoldRows.map((row) => row.id)).toEqual([
+      `turn-fold:${foldIds[0]}`,
+      `turn-fold:${foldIds[1]}`,
+    ]);
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-1-entry",
+      `turn-fold:${foldIds[0]}`,
+      "assistant-a2-entry",
+      "user-2-entry",
+      `turn-fold:${foldIds[1]}`,
+      "assistant-a3-entry",
+    ]);
+
+    const expandedFirstOnly = deriveMessagesTimelineRows({
+      timelineEntries,
+      expandedTurnIds: new Set([foldIds[0]!]),
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+    const expandedFirstFoldRows = expandedFirstOnly.filter(
+      (row): row is Extract<(typeof expandedFirstOnly)[number], { kind: "turn-fold" }> =>
+        row.kind === "turn-fold",
+    );
+    expect(expandedFirstFoldRows.find((row) => row.foldId === foldIds[0])?.expanded).toBe(true);
+    expect(expandedFirstFoldRows.find((row) => row.foldId === foldIds[1])?.expanded).toBe(false);
+    expect(
+      expandedFirstOnly.some((row) => row.kind === "message" && row.message.id === "assistant-a1"),
+    ).toBe(true);
+    expect(expandedFirstOnly.some((row) => row.id === "work-entry-2")).toBe(false);
+
+    // An interruption only labels the turn's last segment.
+    const interruptedFoldRows = deriveMessagesTimelineRows({
+      timelineEntries,
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "interrupted",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:00:26Z",
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    }).filter((row) => row.kind === "turn-fold");
+    expect(interruptedFoldRows.map((row) => row.label)).toEqual([
+      "Worked for 11s",
+      "You stopped after 11s",
+    ]);
+  });
+
   it("keeps a tool group after the terminal response visible when the turn is folded", () => {
     const turnId = TurnId.make("turn-1");
     const timelineEntries = [
